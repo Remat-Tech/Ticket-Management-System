@@ -266,6 +266,14 @@ router.patch('/:id/assign', requireAuth(['admin']), asyncHandler(async (req, res
   const ticket = ticketResult.rows[0];
   if (!ticket) return res.status(404).json({ error: 'not found' });
 
+  // Resolved means it's sitting with the customer awaiting their confirm-fix/
+  // reopen decision, and Closed is the end of the line — swapping the owning
+  // agent on either doesn't make sense, same as the agent-side reassign panel
+  // (app.js's canReassign) already refuses to open for these two statuses.
+  if (ticket.status === 'Closed' || ticket.status === 'Resolved') {
+    return res.status(400).json({ error: `cannot reassign a ${ticket.status.toLowerCase()} ticket` });
+  }
+
   const assignedAgentId = req.body && req.body.assigned_agent_id ? req.body.assigned_agent_id : null;
 
   if (assignedAgentId) {

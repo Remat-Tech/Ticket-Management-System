@@ -2594,6 +2594,15 @@ document.addEventListener('DOMContentLoaded', function () {
       badge.textContent = t.status;
       badge.className = 'status-badge ' + adminStatusClass(t.status);
 
+      // Mirrors the server's own PATCH /:id/assign guard (and the agent
+      // dashboard's canReassign) — Resolved is awaiting the customer's
+      // confirm-fix/reopen call, and Closed is done, so swapping the agent
+      // on either doesn't make sense.
+      var assignLocked = t.status === 'Closed' || t.status === 'Resolved';
+      var adminAssignBtnEl = document.getElementById('adminAssignBtn');
+      adminAssignBtnEl.disabled = assignLocked;
+      adminAssignBtnEl.title = assignLocked ? 'Cannot reassign a ' + t.status.toLowerCase() + ' ticket.' : '';
+
       var serviceBox = document.getElementById('adminDashServiceBox');
       if (t.service) {
         document.getElementById('adminDashService').textContent = t.service;
