@@ -109,6 +109,161 @@ document.addEventListener('DOMContentLoaded', function () {
     return false;
   }
 
+  // ---- Email MFA (every sign-in: customer, agent, admin) ----
+  // The sign-in endpoints no longer return a token — they email a 5-digit
+  // code and respond { mfaRequired, challengeId }. This opens a dialog to
+  // collect the code and resolves with POST /api/auth/mfa/verify's response
+  // ({ token, actor, record, returning }). It rejects with err.cancelled
+  // when the person closes the dialog, or with a normal Error (message
+  // ready to show) when the challenge is dead and they must sign in again.
+  function postJson(path, body) {
+    return fetch(API_BASE + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (response) {
+      return response.json().catch(function () { return {}; }).then(function (data) {
+        return { ok: response.ok, status: response.status, data: data };
+      });
+    });
+  }
+
+  function promptForMfaCode(challenge, email) {
+    return new Promise(function (resolve, reject) {
+      var overlay = document.createElement('div');
+      overlay.className = 'mfa-overlay';
+      overlay.innerHTML =
+        '<div class="mfa-dialog" role="dialog" aria-modal="true" aria-labelledby="mfaTitle">' +
+          '<h2 id="mfaTitle">Check your email</h2>' +
+          '<p class="lead">We sent a 5-digit sign-in code to <strong></strong>. It expires in 10 minutes.</p>' +
+          '<div class="field" id="f-mfaCode">' +
+            '<label for="mfaCode">Sign-in code</label>' +
+            '<input type="text" id="mfaCode" inputmode="numeric" autocomplete="one-time-code" maxlength="5" placeholder="•••••">' +
+            '<div class="err" id="err-mfaCode"></div>' +
+          '</div>' +
+          '<button class="btn-amber" type="button" id="mfaVerify">Verify and sign in</button>' +
+          '<div class="mfa-status" id="mfaStatus" aria-live="polite"></div>' +
+          '<div class="mfa-actions">' +
+            '<a href="#" id="mfaResend">Resend code</a>' +
+            '<a href="#" id="mfaCancel">Cancel</a>' +
+          '</div>' +
+        '</div>';
+      overlay.querySelector('.lead strong').textContent = email;
+      document.body.appendChild(overlay);
+
+      var input = overlay.querySelector('#mfaCode');
+      var field = overlay.querySelector('#f-mfaCode');
+      var errEl = overlay.querySelector('#err-mfaCode');
+      var verifyBtn = overlay.querySelector('#mfaVerify');
+      var resendLink = overlay.querySelector('#mfaResend');
+      var statusEl = overlay.querySelector('#mfaStatus');
+      var verifyLabel = verifyBtn.textContent;
+      var cooldownTimer = null;
+      input.focus();
+
+      function close() {
+        if (cooldownTimer) clearInterval(cooldownTimer);
+        document.removeEventListener('keydown', onKeydown);
+        overlay.remove();
+      }
+      function showError(message) {
+        errEl.textContent = message;
+        field.classList.add('invalid');
+      }
+      function fail(message) {
+        close();
+        reject(new Error(message));
+      }
+      function startResendCooldown(seconds) {
+        var left = seconds;
+        resendLink.setAttribute('aria-disabled', 'true');
+        resendLink.textContent = 'Resend code (' + left + 's)';
+        if (cooldownTimer) clearInterval(cooldownTimer);
+        cooldownTimer = setInterval(function () {
+          left -= 1;
+          if (left <= 0) {
+            clearInterval(cooldownTimer);
+            cooldownTimer = null;
+            resendLink.removeAttribute('aria-disabled');
+            resendLink.textContent = 'Resend code';
+          } else {
+            resendLink.textContent = 'Resend code (' + left + 's)';
+          }
+        }, 1000);
+      }
+      startResendCooldown(60);
+
+      function verify() {
+        if (verifyBtn.disabled) return; // already checking (auto-submit + Enter)
+        var code = input.value.replace(/\D/g, '');
+        if (code.length !== 5) { showError('Enter the 5-digit code from your email.'); return; }
+        field.classList.remove('invalid');
+        verifyBtn.disabled = true;
+        verifyBtn.textContent = 'Verifying…';
+
+        postJson('/api/auth/mfa/verify', { challengeId: challenge.challengeId, code: code })
+          .then(function (res) {
+            if (res.ok) { close(); resolve(res.data); return; }
+            if (res.data.restart) { fail(res.data.error || 'Please sign in again.'); return; }
+            var message = res.data.error || 'Unable to verify the code.';
+            if (res.data.attemptsRemaining) {
+              message += ' ' + res.data.attemptsRemaining + ' attempt' + (res.data.attemptsRemaining === 1 ? '' : 's') + ' left.';
+            }
+            showError(message);
+            input.select();
+          })
+          .catch(function () { showError('Network error. Please try again.'); })
+          .finally(function () {
+            verifyBtn.disabled = false;
+            verifyBtn.textContent = verifyLabel;
+          });
+      }
+
+      function onKeydown(e) {
+        if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+      }
+      function cancel() {
+        close();
+        var err = new Error('Sign-in cancelled.');
+        err.cancelled = true;
+        reject(err);
+      }
+
+      input.addEventListener('input', function () {
+        input.value = input.value.replace(/\D/g, '').slice(0, 5);
+        if (input.value.length === 5) verify();
+      });
+      input.addEventListener('keydown', function (e) { if (e.key === 'Enter') verify(); });
+      verifyBtn.addEventListener('click', verify);
+      document.addEventListener('keydown', onKeydown);
+      overlay.querySelector('#mfaCancel').addEventListener('click', function (e) { e.preventDefault(); cancel(); });
+
+      resendLink.addEventListener('click', function (e) {
+        e.preventDefault();
+        if (resendLink.getAttribute('aria-disabled') === 'true') return;
+        resendLink.setAttribute('aria-disabled', 'true');
+        statusEl.textContent = 'Sending a new code…';
+        postJson('/api/auth/mfa/resend', { challengeId: challenge.challengeId })
+          .then(function (res) {
+            if (res.ok) {
+              statusEl.textContent = 'New code sent. The previous code no longer works.';
+              input.value = '';
+              input.focus();
+              startResendCooldown(60);
+              return;
+            }
+            if (res.data.restart) { fail(res.data.error || 'Please sign in again.'); return; }
+            statusEl.textContent = res.data.error || 'Unable to resend the code.';
+            startResendCooldown(res.data.retryAfterSeconds || 10);
+          })
+          .catch(function () {
+            statusEl.textContent = 'Network error. Please try again.';
+            resendLink.removeAttribute('aria-disabled');
+          });
+      });
+    });
+  }
+
   // ---- Real file uploads (phase 1D-vi) ----
   // Attachments used to be filenames-only — chosen in the browser, never
   // actually read or sent anywhere, so there was nothing to open or
@@ -335,9 +490,13 @@ document.addEventListener('DOMContentLoaded', function () {
             return data;
           });
         })
-        .then(function (data) {
+        .then(function (challenge) {
+          return promptForMfaCode(challenge, email.value.trim());
+        })
+        .then(function (verified) {
           // Normalize the API's `full_name` into the `name` field the rest
           // of app.js (ticket creation, portal, chat) already reads.
+          var data = verified.record;
           var newUser = {
             id: data.id,
             name: data.full_name,
@@ -345,15 +504,16 @@ document.addEventListener('DOMContentLoaded', function () {
             phone: data.phone,
             department: data.department,
             organization: data.organization,
-            token: data.token
+            token: verified.token
           };
           document.getElementById('f-email').classList.remove('invalid');
-          showProfileStub(newUser, data.returning === true);
+          showProfileStub(newUser, verified.returning === true);
           // Hand the profile off to the ticket page — the Render/SQLite
           // record is now the source of truth; this is just a session cache.
           localStorage.setItem('docketUser', JSON.stringify(newUser));
         })
         .catch(function (err) {
+          if (err.cancelled) return;
           console.error('Profile creation error:', err);
           showProfileError(err.message || 'Something went wrong. Please try again.');
         })
@@ -711,10 +871,10 @@ document.addEventListener('DOMContentLoaded', function () {
     });
   }
 
-  // Agent self-sign-in (agent-login.html): the backend's find-or-create-by-email
-  // behavior on POST /api/agents mirrors the app's existing "any password works"
-  // demo design — there's no agent password on the backend to verify against, so
-  // the client-side password check stays as-is (just requires something typed).
+  // Agent self-sign-in (agent-login.html): POST /api/agents finds-or-creates by
+  // email, but there's no agent password on the backend — the emailed MFA code
+  // is what actually proves the agent owns the address. The client-side
+  // password check stays as-is (just requires something typed).
   function loginOrCreateAgentByEmail(email, fallbackName, onDone, onError) {
     fetch(API_BASE + '/api/agents', {
       method: 'POST',
@@ -727,9 +887,12 @@ document.addEventListener('DOMContentLoaded', function () {
           return data;
         });
       })
-      .then(function (data) {
-        var agent = normalizeAgent(data);
-        agent.token = data.token;
+      .then(function (challenge) {
+        return promptForMfaCode(challenge, email);
+      })
+      .then(function (verified) {
+        var agent = normalizeAgent(verified.record);
+        agent.token = verified.token;
         onDone(agent);
       })
       .catch(onError);
@@ -788,9 +951,10 @@ document.addEventListener('DOMContentLoaded', function () {
           token: record.token
         }, document.getElementById('keepSignedIn').checked);
       }, function (err) {
-        console.error('Agent sign-in error:', err);
         submitAgentLoginBtn.disabled = false;
         submitAgentLoginBtn.textContent = submitAgentLoginDefaultLabel;
+        if (err.cancelled) return;
+        console.error('Agent sign-in error:', err);
         document.getElementById('f-agentEmail').classList.add('invalid');
         alert(err.message || 'Unable to sign in. Please try again.');
       });
@@ -837,9 +1001,15 @@ document.addEventListener('DOMContentLoaded', function () {
       })
         .then(function (response) {
           return response.json().then(function (data) {
-            if (!response.ok) throw new Error('Incorrect email or password.');
+            // 401 stays generic (don't say which half was wrong); anything
+            // else — rate limit, email send failure — shows the real reason.
+            if (response.status === 401) throw new Error('Incorrect email or password.');
+            if (!response.ok) throw new Error(data.error || 'Unable to sign in.');
             return data;
           });
+        })
+        .then(function (challenge) {
+          return promptForMfaCode(challenge, email.value.trim());
         })
         .then(function (data) {
           var admin = { id: data.actor.id, name: data.actor.full_name, email: data.actor.email, token: data.token };
@@ -857,6 +1027,7 @@ document.addEventListener('DOMContentLoaded', function () {
           }, document.getElementById('adminKeepSignedIn').checked);
         })
         .catch(function (err) {
+          if (err.cancelled) return;
           emailField.classList.add('invalid');
           passwordField.classList.add('invalid');
           emailErr.textContent = err.message || 'Incorrect email or password.';
@@ -2879,7 +3050,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
       fetch(API_BASE + '/api/agents', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
         body: JSON.stringify({
           full_name: nameField.value.trim(),
           email: emailField.value.trim(),

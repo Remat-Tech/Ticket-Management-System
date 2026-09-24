@@ -56,6 +56,28 @@ CREATE TABLE IF NOT EXISTS auth_credentials (
   )
 );
 
+-- One row per emailed sign-in code (email MFA, required for every actor
+-- type). Only an HMAC of the 5-digit code is stored, never the code
+-- itself. owner_id is null for a first-time user/agent sign-in: the
+-- profile they submitted waits in context.pending and the users/agents row
+-- is only created once they prove they own the email, so nobody can
+-- register someone else's address.
+CREATE TABLE IF NOT EXISTS mfa_challenges (
+  id            TEXT PRIMARY KEY,            -- random UUID, handed to the client
+  owner_type    TEXT NOT NULL,               -- user | agent | admin
+  owner_id      TEXT,                        -- null until a pending account is created
+  email         TEXT NOT NULL,
+  code_hash     TEXT NOT NULL,
+  context       JSONB NOT NULL DEFAULT '{}',
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  send_count    INTEGER NOT NULL DEFAULT 1,
+  last_sent_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at    TIMESTAMPTZ NOT NULL,
+  consumed_at   TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (owner_type IN ('user', 'agent', 'admin'))
+);
+
 CREATE TABLE IF NOT EXISTS tickets (
   id                  TEXT PRIMARY KEY,      -- TKT-2026-000001
   user_id             TEXT NOT NULL REFERENCES users(id),
@@ -144,6 +166,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_ticket ON ticket_comments(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_ticket ON ticket_attachments(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_comment ON ticket_attachments(comment_id);
 CREATE INDEX IF NOT EXISTS idx_auth_owner ON auth_credentials(owner_type, owner_id);
+CREATE INDEX IF NOT EXISTS idx_mfa_challenges_email ON mfa_challenges(owner_type, email, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_actor ON audit_logs(actor_type, actor_id);

@@ -8,12 +8,17 @@
 // logged in) is a separate concern, handled by requireAuth(role) in
 // middleware/authenticate.js on individual routes — not by having three
 // separate login endpoints.
+//
+// A correct password doesn't log you in by itself: it starts an email MFA
+// challenge (see utils/mfa.js) and the token is issued by POST /mfa/verify.
 
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const db = require('../db/connection');
 const { signToken } = require('../middleware/authenticate');
 const { recordAuditLog } = require('../utils/audit');
+const { nextId } = require('../utils/ids');
+const { createChallenge, verifyChallenge, resendChallenge, MfaError, sendMfaError } = require('../utils/mfa');
 
 const router = express.Router();
 
@@ -103,33 +108,150 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    await db.query(
-      `UPDATE auth_credentials SET last_login_at = now(), updated_at = now() WHERE id = $1`,
-      [cred.id]
-    );
-
-    const token = signToken({ ownerType: owner.ownerType, ownerId: owner.id });
+    // Password is right — but no token yet. The token only comes out of
+    // POST /mfa/verify once the emailed code is entered.
+    const challenge = await createChallenge({
+      ownerType: owner.ownerType,
+      ownerId: owner.id,
+      email: owner.email,
+      fullName: owner.full_name
+    });
 
     recordAuditLog({
       actorType: owner.ownerType,
       actorId: owner.id,
       actorName: owner.full_name,
-      action: 'auth.login_success',
+      action: 'auth.mfa_sent',
       details: { email }
+    });
+
+    res.json(challenge);
+  } catch (err) {
+    if (err instanceof MfaError) return sendMfaError(res, err);
+    console.error('POST /api/auth/login error:', err);
+    res.status(500).json({ error: 'failed to log in' });
+  }
+});
+
+// Finds the account a verified challenge belongs to — or, for a first-time
+// user/agent sign-in, creates it now that the email is proven. Returns
+// { record, created }.
+async function resolveChallengeOwner(challenge) {
+  const table = OWNER_TABLES.find((t) => t.ownerType === challenge.owner_type).table;
+
+  if (challenge.owner_id) {
+    const result = await db.query(`SELECT * FROM ${table} WHERE id = $1`, [challenge.owner_id]);
+    return { record: result.rows[0], created: false };
+  }
+
+  const pending = challenge.context.pending;
+  if (!pending || table === 'admins') return { record: null, created: false };
+
+  // Two sign-ups for the same new email can both reach here; the second one
+  // just picks up the row the first created.
+  const existing = await db.query(`SELECT * FROM ${table} WHERE email = $1`, [challenge.email]);
+  if (existing.rows[0]) return { record: existing.rows[0], created: false };
+
+  let inserted;
+  if (table === 'users') {
+    const id = await nextId(db, 'users', 'USR');
+    inserted = await db.query(
+      `INSERT INTO users (id, full_name, email, phone, department, organization)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (email) DO NOTHING RETURNING *`,
+      [id, pending.full_name, challenge.email, pending.phone || null, pending.department || null, pending.organization || null]
+    );
+  } else {
+    const id = await nextId(db, 'agents', 'AGT');
+    inserted = await db.query(
+      `INSERT INTO agents (id, full_name, email, created_by) VALUES ($1, $2, $3, 'self-signup')
+       ON CONFLICT (email) DO NOTHING RETURNING *`,
+      [id, pending.full_name, challenge.email]
+    );
+    if (inserted.rows[0]) {
+      recordAuditLog({
+        actorType: 'agent',
+        actorName: pending.full_name,
+        action: 'agent.created',
+        entityType: 'agent',
+        entityId: inserted.rows[0].id,
+        details: { email: challenge.email, created_by: 'self-signup' }
+      });
+    }
+  }
+
+  if (inserted.rows[0]) return { record: inserted.rows[0], created: true };
+  const raced = await db.query(`SELECT * FROM ${table} WHERE email = $1`, [challenge.email]);
+  return { record: raced.rows[0], created: false };
+}
+
+// POST /api/auth/mfa/verify  { challengeId, code }
+// The only route that issues a session token. Response:
+//   { token, actor: { id, email, full_name, role }, record, returning }
+// where `record` is the full users/agents/admins row.
+router.post('/mfa/verify', async (req, res) => {
+  const { challengeId, code } = req.body || {};
+
+  try {
+    const challenge = await verifyChallenge(challengeId, code);
+    const { record, created } = await resolveChallengeOwner(challenge);
+
+    if (!record) {
+      // The account was deleted between login and verify.
+      return res.status(401).json({ error: 'This account no longer exists.', restart: true });
+    }
+
+    await db.query(
+      `UPDATE auth_credentials SET last_login_at = now(), updated_at = now()
+       WHERE owner_type = $1 AND owner_id = $2`,
+      [challenge.owner_type, record.id]
+    );
+
+    const token = signToken({ ownerType: challenge.owner_type, ownerId: record.id });
+
+    recordAuditLog({
+      actorType: challenge.owner_type,
+      actorId: record.id,
+      actorName: record.full_name,
+      action: 'auth.login_success',
+      details: { email: record.email, mfa: 'email' }
     });
 
     res.json({
       token,
       actor: {
-        id: owner.id,
-        email: owner.email,
-        full_name: owner.full_name,
-        role: owner.ownerType
-      }
+        id: record.id,
+        email: record.email,
+        full_name: record.full_name,
+        role: challenge.owner_type
+      },
+      record,
+      returning: !created
     });
   } catch (err) {
-    console.error('POST /api/auth/login error:', err);
-    res.status(500).json({ error: 'failed to log in' });
+    if (err instanceof MfaError) {
+      const challenge = err.extra.challenge;
+      recordAuditLog({
+        actorType: challenge ? challenge.owner_type : 'unknown',
+        actorId: challenge ? challenge.owner_id : null,
+        action: 'auth.mfa_failed',
+        details: { email: challenge ? challenge.email : null, reason: err.message }
+      });
+      return sendMfaError(res, err);
+    }
+    console.error('POST /api/auth/mfa/verify error:', err);
+    res.status(500).json({ error: 'failed to verify code' });
+  }
+});
+
+// POST /api/auth/mfa/resend  { challengeId }
+router.post('/mfa/resend', async (req, res) => {
+  try {
+    res.json(await resendChallenge((req.body || {}).challengeId));
+  } catch (err) {
+    if (err instanceof MfaError) return sendMfaError(res, err);
+    console.error('POST /api/auth/mfa/resend error:', err);
+    res.status(500).json({ error: 'failed to resend code' });
   }
 });
 

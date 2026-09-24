@@ -1,22 +1,19 @@
 const express = require('express');
 const db = require('../db/connection');
-const { nextId } = require('../utils/ids');
-const { signToken } = require('../middleware/authenticate');
+const { recordAuditLog } = require('../utils/audit');
+const { createChallenge, MfaError, sendMfaError } = require('../utils/mfa');
 
 const router = express.Router();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // POST /api/users
-// Creates a new user profile, or — if a user with this email already
-// exists — returns that existing record instead of erroring, so the
-// front end can treat "sign up" and "returning visitor" the same way.
-//
-// Customers have no password of their own (same "email is the whole
-// identity" trust level as agent self-signup — see agents.js), so a
-// session token is minted and returned right here rather than requiring
-// a separate POST /api/auth/login call the customer has no credentials
-// for.
+// Sign-in / sign-up for customers, who have no password: the emailed MFA
+// code is the credential. Either way (new or returning email) this only
+// starts a challenge and responds { mfaRequired, challengeId } — the token
+// and the user record come from POST /api/auth/mfa/verify. A new user's
+// row isn't created until then, so nobody can register someone else's
+// email.
 router.post('/', async (req, res) => {
   const { full_name, email, phone, department, organization } = req.body || {};
 
@@ -32,20 +29,34 @@ router.post('/', async (req, res) => {
   try {
     const existingResult = await db.query('SELECT * FROM users WHERE email = $1', [normalizedEmail]);
     const existing = existingResult.rows[0];
-    if (existing) {
-      const token = signToken({ ownerType: 'user', ownerId: existing.id });
-      return res.status(200).json({ ...existing, returning: true, token });
-    }
 
-    const id = await nextId(db, 'users', 'USR');
-    const insertResult = await db.query(
-      `INSERT INTO users (id, full_name, email, phone, department, organization)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [id, full_name.trim(), normalizedEmail, phone || null, department || null, organization || null]
-    );
-    const token = signToken({ ownerType: 'user', ownerId: id });
-    res.status(201).json({ ...insertResult.rows[0], returning: false, token });
+    const challenge = existing
+      ? await createChallenge({ ownerType: 'user', ownerId: existing.id, email: normalizedEmail, fullName: existing.full_name })
+      : await createChallenge({
+          ownerType: 'user',
+          email: normalizedEmail,
+          fullName: full_name.trim(),
+          context: {
+            pending: {
+              full_name: full_name.trim(),
+              phone: phone || null,
+              department: department || null,
+              organization: organization || null
+            }
+          }
+        });
+
+    recordAuditLog({
+      actorType: 'user',
+      actorId: existing ? existing.id : null,
+      actorName: existing ? existing.full_name : full_name.trim(),
+      action: 'auth.mfa_sent',
+      details: { email: normalizedEmail, new_account: !existing }
+    });
+
+    res.json(challenge);
   } catch (err) {
+    if (err instanceof MfaError) return sendMfaError(res, err);
     console.error('POST /api/users error:', err);
     res.status(500).json({ error: 'failed to save profile' });
   }
