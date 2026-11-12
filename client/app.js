@@ -1,8 +1,10 @@
 // ---- API configuration ----
-const API_BASE =
-  window.location.hostname === 'localhost'
-    ? 'http://localhost:4000'
-    : 'https://ticket-management-system-9ssy.onrender.com';
+// Pages served from a local host talk to the local API on the same host, so
+// local testing never reaches production data.
+const LOCAL_HOSTS = ['localhost', '127.0.0.1'];
+const API_BASE = LOCAL_HOSTS.includes(window.location.hostname)
+  ? `http://${window.location.hostname}:4000`
+  : 'https://ticket-management-system-9ssy.onrender.com';
 
 // Must match CODE_LENGTH in docket-server/utils/mfa.js.
 const MFA_CODE_LENGTH = 6;
