@@ -89,6 +89,22 @@ router.post('/', requireAuth(), requireTicketAccess(TICKET_ACCESS), asyncHandler
   const authorType = ROLE_TO_AUTHOR_TYPE[req.actor.role];
   const authorName = await lookupActorName(req.actor);
 
+  // Validate everything that doesn't depend on the files BEFORE uploading,
+  // so a rejected request never leaves orphaned objects in storage.
+  const vis = visibility || 'public';
+  if (!['public', 'internal'].includes(vis)) {
+    return res.status(400).json({ error: "visibility must be 'public' or 'internal'" });
+  }
+  // Only agents/admins can post internal notes — checked against the
+  // authenticated role, so a customer can no longer get an internal note
+  // recorded just by sending author_type: 'agent' in the body.
+  if (authorType === 'customer' && vis === 'internal') {
+    return res.status(400).json({ error: 'customer comments cannot be marked internal' });
+  }
+  if (body != null && typeof body !== 'string') {
+    return res.status(400).json({ error: 'body must be a string' });
+  }
+
   // requireTicketAccess has already confirmed the ticket exists and this
   // actor may act on it, so attachment writes below only ever happen for
   // an authorized caller.
@@ -99,18 +115,10 @@ router.post('/', requireAuth(), requireTicketAccess(TICKET_ACCESS), asyncHandler
     return res.status(400).json({ error: err.message });
   }
 
+  // Needs the upload result, so it can't move above. An empty message
+  // means no files were uploaded, so there's nothing to clean up here.
   if ((!body || !body.trim()) && !normalizedFiles.length) {
     return res.status(400).json({ error: 'a message needs body text or at least one file' });
-  }
-  const vis = visibility || 'public';
-  if (!['public', 'internal'].includes(vis)) {
-    return res.status(400).json({ error: "visibility must be 'public' or 'internal'" });
-  }
-  // Only agents/admins can post internal notes — checked against the
-  // authenticated role, so a customer can no longer get an internal note
-  // recorded just by sending author_type: 'agent' in the body.
-  if (authorType === 'customer' && vis === 'internal') {
-    return res.status(400).json({ error: 'customer comments cannot be marked internal' });
   }
 
   let commentId;
