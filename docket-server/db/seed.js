@@ -19,7 +19,11 @@ async function seedAdmin() {
   const adminId = 'ADM-2026-000001';
   // Must be a mailbox someone can read: the login MFA code and password
   // reset links are sent here.
-  const adminEmail = (process.env.ADMIN_EMAIL || 'rematsd04@gmail.com').trim().toLowerCase();
+  const adminEmail = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+  if (!adminEmail) {
+    console.warn('ADMIN_EMAIL is not set — skipping admin seed; existing admin account is unchanged.');
+    return;
+  }
 
   // DO UPDATE on email so re-running the seed with a new ADMIN_EMAIL fixes
   // the existing row instead of silently keeping the old address.
