@@ -15,6 +15,12 @@ test.before(async () => {
 
 test.after(() => new Promise((resolve) => server.close(resolve)));
 
+test('responses do not reveal Express through X-Powered-By', async () => {
+  const res = await fetch(`${baseUrl}/`);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.has('x-powered-by'), false);
+});
+
 test('/api/health returns 503 before the server is ready', async () => {
   const res = await fetch(`${baseUrl}/api/health`);
   assert.equal(res.status, 503);
