@@ -7,6 +7,8 @@ const rateLimit = require('express-rate-limit');
 const db = require('./db/connection');
 
 const app = express();
+// Avoid disclosing the API framework in HTTP response headers.
+app.disable('x-powered-by');
 
 // Set by server.js once database setup has succeeded. Until then the server
 // is up but can't serve anything that needs the database.
