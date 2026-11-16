@@ -18,6 +18,10 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // Matches app.js's own cap in readFileAsAttachment — kept in sync manually
 // since the client and server run in different processes.
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_REQUEST = 5;
+const ALLOWED_ATTACHMENT_EXTENSIONS = new Set([
+  'pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'txt', 'csv', 'log', 'doc', 'docx', 'xls', 'xlsx'
+]);
 
 // Strips path separators and ".." so a crafted filename (e.g.
 // "../../etc/passwd") can't escape the ticket's attachment folder. Only
@@ -108,22 +112,34 @@ async function uploadAllOrNone(items, upload) {
   return results.map((r) => r.value).filter(Boolean);
 }
 
-// Validates one incoming attachment payload and — if it carries content —
-// uploads it immediately, before any DB row exists for it. Accepts the
-// { filename, content_base64, mime_type? } shape the client sends; also
-// tolerates a bare filename string or an object with no content_base64
-// (nothing to upload, so stored_path stays null).
+// Validate the entire request before any storage write. A bad sixth file must
+// not cause the first five files to be uploaded and then cleaned up.
+function validateIncomingAttachments(items) {
+  if (items == null) return [];
+  if (!Array.isArray(items)) throw new Error('Attachments must be an array.');
+  if (items.length > MAX_ATTACHMENTS_PER_REQUEST) {
+    throw new Error(`A request may include at most ${MAX_ATTACHMENTS_PER_REQUEST} attachments.`);
+  }
+  for (const [index, item] of items.entries()) {
+    if (!item || typeof item !== 'object' || Array.isArray(item) ||
+        typeof item.filename !== 'string' || !item.filename.trim()) {
+      throw new Error(`Attachment ${index + 1} must have a filename.`);
+    }
+    const extension = item.filename.trim().split('.').pop().toLowerCase();
+    if (!ALLOWED_ATTACHMENT_EXTENSIONS.has(extension)) {
+      throw new Error(`Attachment "${item.filename}" has a file type that is not allowed.`);
+    }
+    if (typeof item.content_base64 !== 'string' || !item.content_base64.trim() ||
+        !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(item.content_base64)) {
+      throw new Error(`Attachment "${item.filename}" must have valid base64 file content.`);
+    }
+  }
+  return items;
+}
+
+// Upload one validated { filename, content_base64, mime_type? } payload.
 async function normalizeIncomingAttachment(ticketId, a) {
-  if (!a) return null;
-  if (typeof a === 'string') {
-    const filename = a.trim();
-    return filename ? { filename, mime_type: null, size_bytes: null, stored_path: null } : null;
-  }
-  const filename = a.filename && String(a.filename).trim();
-  if (!filename) return null;
-  if (!a.content_base64) {
-    return { filename, mime_type: a.mime_type || null, size_bytes: null, stored_path: null };
-  }
+  const filename = a.filename.trim();
   const { storedPath, sizeBytes } = await saveAttachmentFile(ticketId, filename, a.content_base64);
   return { filename, mime_type: a.mime_type || null, size_bytes: sizeBytes, stored_path: storedPath };
 }
@@ -133,8 +149,8 @@ async function normalizeIncomingAttachment(ticketId, a) {
 // treated as no attachments. Throws a user-facing error (e.g. over the size
 // cap) for the route to return as a 400.
 async function uploadIncomingAttachments(ticketId, items) {
-  if (!Array.isArray(items)) return [];
-  return uploadAllOrNone(items, (a) => normalizeIncomingAttachment(ticketId, a));
+  const validated = validateIncomingAttachments(items);
+  return uploadAllOrNone(validated, (a) => normalizeIncomingAttachment(ticketId, a));
 }
 
 // Inserts the rows for already-uploaded attachments, inside the caller's
@@ -159,9 +175,11 @@ module.exports = {
   restoreAttachmentFile,
   removeAttachmentFiles,
   uploadAllOrNone,
+  validateIncomingAttachments,
   uploadIncomingAttachments,
   insertAttachmentRows,
   sanitizeFilename,
   MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENTS_PER_REQUEST,
   BUCKET
 };
