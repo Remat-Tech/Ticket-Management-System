@@ -127,7 +127,17 @@ async function completeReset(token, newPassword) {
   const passwordProblem = validatePassword(newPassword);
   if (passwordProblem) throw new PasswordResetError(400, passwordProblem);
 
-  const passwordHash = bcrypt.hashSync(newPassword, 10);
+  const hashedToken = hashToken(token);
+  const available = await db.query(
+    `SELECT 1 FROM password_reset_tokens
+     WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()`,
+    [hashedToken]
+  );
+  if (!available.rows[0]) {
+    throw new PasswordResetError(400, 'This reset link is invalid or has expired.');
+  }
+
+  const passwordHash = await bcrypt.hash(newPassword, 10);
 
   return db.withTransaction(async (client) => {
     // Claim the token first, atomically, so two submissions of the same
@@ -136,7 +146,7 @@ async function completeReset(token, newPassword) {
       `UPDATE password_reset_tokens SET used_at = now()
        WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()
        RETURNING owner_type, owner_id`,
-      [hashToken(token)]
+      [hashedToken]
     );
     const row = claimed.rows[0];
     if (!row) throw new PasswordResetError(400, 'This reset link is invalid or has expired.');
